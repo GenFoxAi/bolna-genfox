@@ -141,6 +141,9 @@ class DeepgramSynthesizer(BaseSynthesizer):
             # Wait for WebSocket connection to be established
             ws_wait_start = time.perf_counter()
             while self.websocket_holder["websocket"] is None or self.websocket_holder["websocket"].state is websockets.protocol.State.CLOSED:
+                if self.conversation_ended:
+                    logger.info("Conversation ended, stopping sender wait loop")
+                    return
                 logger.info("Waiting for Deepgram TTS WebSocket connection to be established...")
                 await asyncio.sleep(0.5)
             ws_wait_time = (time.perf_counter() - ws_wait_start) * 1000
@@ -401,6 +404,8 @@ class DeepgramSynthesizer(BaseSynthesizer):
         max_failures = 3
 
         while consecutive_failures < max_failures:
+            if self.conversation_ended:
+                break
             if self.websocket_holder["websocket"] is None or self.websocket_holder["websocket"].state is websockets.protocol.State.CLOSED:
                 logger.info("Re-establishing Deepgram TTS connection...")
                 result = await self.establish_connection()

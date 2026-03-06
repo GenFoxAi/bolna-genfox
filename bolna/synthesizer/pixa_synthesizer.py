@@ -120,6 +120,9 @@ class PixaSynthesizer(BaseSynthesizer):
                 return
 
             while self.websocket_holder["websocket"] is None or self.websocket_holder["websocket"].state != websockets.protocol.State.OPEN:
+                if self.conversation_ended:
+                    logger.info("Conversation ended, stopping sender wait loop")
+                    return
                 logger.info("Waiting for Pixa WebSocket connection to be established...")
                 await asyncio.sleep(0.5)
 
@@ -334,6 +337,8 @@ class PixaSynthesizer(BaseSynthesizer):
         max_failures = 3
 
         while consecutive_failures < max_failures:
+            if self.conversation_ended:
+                break
             if self.websocket_holder["websocket"] is None or self.websocket_holder["websocket"].state != websockets.protocol.State.OPEN:
                 logger.info("Re-establishing Pixa connection...")
                 result = await self.establish_connection()

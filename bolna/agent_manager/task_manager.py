@@ -25,7 +25,7 @@ from bolna.enums import TelephonyProvider
 from bolna.prompts import *
 from bolna.helpers.language_detector import LanguageDetector
 from bolna.helpers.utils import structure_system_prompt, compute_function_pre_call_message, select_message_by_language, get_date_time_from_timezone, calculate_audio_duration, create_ws_data_packet, get_file_names_in_directory, get_raw_audio_bytes, is_valid_md5, \
-    get_required_input_types, format_messages, get_prompt_responses, resample, save_audio_file_to_s3, update_prompt_with_context, get_md5_hash, clean_json_string, wav_bytes_to_pcm, convert_to_request_log, yield_chunks_from_memory, process_task_cancellation, pcm_to_ulaw
+    get_required_input_types, format_messages, get_prompt_responses, resample, save_audio_file_to_s3, update_prompt_with_context, get_md5_hash, clean_json_string, wav_bytes_to_pcm, convert_to_request_log, yield_chunks_from_memory, process_task_cancellation, pcm_to_ulaw, get_synth_audio_format
 from bolna.helpers.logger_config import configure_logger
 from ..helpers.mark_event_meta_data import MarkEventMetaData
 from ..helpers.observable_variable import ObservableVariable
@@ -418,8 +418,6 @@ class TaskManager(BaseManager):
         # setting transcriber and synthesizer in parallel
         self.__setup_transcriber()
         self.__setup_synthesizer(self.llm_config)
-        if not self.turn_based_conversation and task_id == 0:
-            self.synthesizer_monitor_task = asyncio.create_task(self.tools['synthesizer'].monitor_connection())
 
         # # setting llm
         # llm = self.__setup_llm(self.llm_config)
@@ -583,15 +581,19 @@ class TaskManager(BaseManager):
             raise "Other input handlers not supported yet"
 
     async def message_task_new(self):
+        logger.info(f"Entered message_task_new. _is_conversation_task: {self._is_conversation_task()}, turn_based: {self.turn_based_conversation}, is_web: {self.is_web_based_call}")
         tasks = []
         if self._is_conversation_task():
             tasks.append(self.tools['input'].handle())
 
             if not self.turn_based_conversation and not self.is_web_based_call:
+                logger.info("Spawning __forced_first_message task for telephony")
                 tasks.append(self.__forced_first_message())
 
         if tasks:
+            logger.info(f"Gathering {len(tasks)} tasks in message_task_new")
             await asyncio.gather(*tasks)
+            logger.info("message_task_new tasks gathered and complete")
 
     def __setup_input_handlers(self, turn_based_conversation, input_queue, should_record):
         if self.task_config["tools_config"]["input"]["provider"] in SUPPORTED_INPUT_HANDLERS.keys():
@@ -627,7 +629,7 @@ class TaskManager(BaseManager):
         else:
             raise "Other input handlers not supported yet"
 
-    async def __forced_first_message(self, timeout=10.0):
+    async def __forced_first_message(self, timeout=60.0):
         logger.info(f"Executing the first message task")
         try:
             start_time = asyncio.get_running_loop().time()
@@ -639,7 +641,8 @@ class TaskManager(BaseManager):
                     break
 
                 text = self.kwargs.get('agent_welcome_message', None)
-                meta_info = {'io': self.tools["output"].get_provider(), 'message_category': 'agent_welcome_message', "request_id": str(uuid.uuid4()), "cached": True, "sequence_id": -1, 'format': self.task_config["tools_config"]["output"]["format"], 'text': text, 'end_of_llm_stream': True}
+                is_cached = self.preloaded_welcome_audio is not None
+                meta_info = {'io': self.tools["output"].get_provider(), 'message_category': 'agent_welcome_message', "request_id": str(uuid.uuid4()), "cached": is_cached, "sequence_id": -1, "is_first_message": True, 'format': self.task_config["tools_config"]["output"]["format"], 'text': text, 'end_of_llm_stream': True}
                 ws_data_packet = create_ws_data_packet(text, meta_info=meta_info)
 
                 meta_info = ws_data_packet["meta_info"]
@@ -674,10 +677,42 @@ class TaskManager(BaseManager):
                     await self.tools["output"].set_stream_sid(stream_sid)
 
                     if audio_chunk is None:
-                        # No welcome message to play - mark as played immediately
-                        # so the system doesn't wait for a mark event that will never arrive
-                        logger.info("No welcome message audio to send, marking welcome message as played")
-                        self.tools["input"].is_welcome_message_played = True
+                        # No preloaded audio — synthesize via HTTP directly.
+                        # IMPORTANT: Do NOT use _synthesize() / push() here.
+                        # In stream=False (HTTP) mode push() puts the message on
+                        # internal_queue, but generate() returns immediately so nothing
+                        # ever consumes that queue for the welcome message path.
+                        # Instead, call synthesize() directly, decode the base64 WAV
+                        # that Sarvam returns, convert it to 8kHz PCM, and dispatch
+                        # it straight to the Twilio output handler.
+                        logger.info(f"No preloaded audio. Synthesizing welcome message via HTTP: {text!r}")
+                        try:
+                            b64_audio = await self.tools["synthesizer"].synthesize(text)
+                            if b64_audio:
+                                raw_audio = base64.b64decode(b64_audio)
+                                fmt = get_synth_audio_format(raw_audio)
+                                resampled = resample(raw_audio, self.sampling_rate, format=fmt)
+                                if fmt == "wav":
+                                    pcm_audio = wav_bytes_to_pcm(resampled)
+                                else:
+                                    pcm_audio = resampled
+                                meta_info["format"] = "pcm"
+                                meta_info["end_of_synthesizer_stream"] = True
+                                welcome_audio_message = create_ws_data_packet(pcm_audio, meta_info)
+                                self.tools["input"].update_is_audio_being_played(True)
+                                convert_to_request_log(
+                                    message=text, meta_info=meta_info,
+                                    component="synthesizer", direction="response",
+                                    model=self.synthesizer_provider, is_cached=False,
+                                    engine=self.tools["synthesizer"].get_engine(),
+                                    run_id=self.run_id
+                                )
+                                await self.tools["output"].handle(welcome_audio_message)
+                                logger.info("Welcome message synthesized and sent to output handler successfully")
+                            else:
+                                logger.error("Welcome message synthesis (HTTP) returned no audio — check Sarvam API key/quota")
+                        except Exception as _welcome_exc:
+                            logger.error(f"Failed to synthesize/send welcome message: {_welcome_exc}", exc_info=True)
                     else:
                         self.tools["input"].update_is_audio_being_played(True)
                         convert_to_request_log(message=text, meta_info=meta_info, component="synthesizer", direction="response", model=self.synthesizer_provider, is_cached=meta_info.get("is_cached", False), engine=self.tools['synthesizer'].get_engine(), run_id=self.run_id)
@@ -737,33 +772,93 @@ class TaskManager(BaseManager):
             logger.error(f"Something went wrong with starting transcriber {e}")
 
     def __setup_synthesizer(self, llm_config=None):
+        """Instantiate synthesizer and (when applicable) start its WS monitor.
+
+        Key goals:
+        - Keep turn-based (dashboard) behavior unchanged (mp3, optional streaming).
+        - For telephony / non-turn-based streaming, ensure WS-capable synths (e.g., Sarvam) have a live connection by starting monitor_connection.
+        - Avoid starting duplicate monitor tasks.
+        - Keep caching behavior backward-compatible.
+        """
         if self._is_conversation_task():
-            self.kwargs["use_turbo"] = self.task_config["tools_config"]["transcriber"]["language"] == DEFAULT_LANGUAGE_CODE
-        if self.task_config["tools_config"]["synthesizer"] is not None:
-            if "caching" in self.task_config['tools_config']['synthesizer']:
-                caching = self.task_config["tools_config"]["synthesizer"].pop("caching")
+            self.kwargs["use_turbo"] = (
+                self.task_config["tools_config"]["transcriber"]["language"] == DEFAULT_LANGUAGE_CODE
+            )
+
+        synth_cfg = self.task_config["tools_config"].get("synthesizer")
+        if synth_cfg is None:
+            logger.info("Synthesizer config is None; skipping synthesizer setup.")
+            return
+
+        # ---- caching flag (default True) ----
+        caching = synth_cfg.pop("caching", True)
+
+        # ---- provider + provider_config ----
+        self.synthesizer_provider = synth_cfg.pop("provider")
+        synthesizer_class = SUPPORTED_SYNTHESIZER_MODELS.get(self.synthesizer_provider)
+        if synthesizer_class is None:
+            raise ValueError(f"Unsupported synthesizer provider: {self.synthesizer_provider}")
+
+        provider_config = synth_cfg.pop("provider_config")
+        self.synthesizer_voice = provider_config.get("voice")
+
+        # ---- dashboard / turn-based overrides ----
+        if self.turn_based_conversation:
+            # Hard-code mp3 for dashboard, and stream only if enforce_streaming is enabled
+            synth_cfg["audio_format"] = "mp3"
+            synth_cfg["stream"] = True if self.enforce_streaming else False
+
+        # ---- Configure use_mulaw for Asterisk/sip-trunk to ensure synthesizer outputs ulaw ----
+        synthesizer_kwargs = self.kwargs.copy()
+        if self.task_config["tools_config"]["output"]["provider"] == TelephonyProvider.SIP_TRUNK.value:
+            synthesizer_kwargs["use_mulaw"] = True
+            logger.info("[SIP-TRUNK] Configuring synthesizer with use_mulaw=True for Asterisk sip-trunk")
+
+        # ---- Instantiate synthesizer ----
+        self.tools["synthesizer"] = synthesizer_class(
+            **synth_cfg,
+            **provider_config,
+            **synthesizer_kwargs,
+            caching=caching,
+        )
+
+        # ---- Update stream flag after any overrides ----
+        try:
+            self.stream = bool(synth_cfg.get("stream", False)) and (
+                self.enforce_streaming or not self.turn_based_conversation
+            )
+        except Exception:
+            pass
+
+        # ---- Start WS monitor (only if needed) ----
+        try:
+            stream_enabled = bool(synth_cfg.get("stream", False))
+            supports_ws = bool(getattr(self.tools["synthesizer"], "supports_websocket", lambda: False)())
+            should_monitor = (not self.turn_based_conversation) and stream_enabled and supports_ws
+
+            if should_monitor:
+                task = getattr(self, "synthesizer_monitor_task", None)
+                if task is None or task.done():
+                    logger.info(
+                        f"[task_manager] starting synthesizer monitor_connection "
+                        f"(provider={self.synthesizer_provider}, stream={stream_enabled}, supports_ws={supports_ws})"
+                    )
+                    self.synthesizer_monitor_task = asyncio.create_task(
+                        self.tools["synthesizer"].monitor_connection()
+                    )
+                else:
+                    logger.info("[task_manager] synthesizer monitor_connection already running; not starting another.")
             else:
-                caching = True
+                logger.info(
+                    f"[task_manager] not starting synthesizer monitor_connection "
+                    f"(turn_based={self.turn_based_conversation}, stream={stream_enabled}, supports_ws={supports_ws})"
+                )
+        except Exception as e:
+            logger.error(f"[task_manager] failed to start synthesizer monitor_connection: {e}", exc_info=True)
 
-            self.synthesizer_provider = self.task_config["tools_config"]["synthesizer"].pop("provider")
-            synthesizer_class = SUPPORTED_SYNTHESIZER_MODELS.get(self.synthesizer_provider)
-            provider_config = self.task_config["tools_config"]["synthesizer"].pop("provider_config")
-            self.synthesizer_voice = provider_config["voice"]
-            if self.turn_based_conversation:
-                self.task_config["tools_config"]["synthesizer"]["audio_format"] = "mp3" # Hard code mp3 if we're connected through dashboard
-                self.task_config["tools_config"]["synthesizer"]["stream"] = True if self.enforce_streaming else False #Hardcode stream to be False as we don't want to get blocked by a __listen_synthesizer co-routine
-
-            # Configure use_mulaw for Asterisk/sip-trunk to ensure synthesizer outputs ulaw
-            synthesizer_kwargs = self.kwargs.copy()
-            if self.task_config["tools_config"]["output"]["provider"] == TelephonyProvider.SIP_TRUNK.value:
-                synthesizer_kwargs['use_mulaw'] = True
-                logger.info(f"[SIP-TRUNK] Configuring synthesizer with use_mulaw=True for Asterisk sip-trunk")
-            
-            self.tools["synthesizer"] = synthesizer_class(**self.task_config["tools_config"]["synthesizer"], **provider_config, **synthesizer_kwargs, caching=caching)
-            # if not self.turn_based_conversation:
-            #     self.synthesizer_monitor_task = asyncio.create_task(self.tools['synthesizer'].monitor_connection())
-            if self.task_config["tools_config"]["llm_agent"] is not None and llm_config is not None:
-                llm_config["buffer_size"] = self.task_config["tools_config"]["synthesizer"].get('buffer_size')
+        # ---- Pass buffer_size to llm agent if used ----
+        if self.task_config["tools_config"].get("llm_agent") is not None and llm_config is not None:
+            llm_config["buffer_size"] = synth_cfg.get("buffer_size")
 
     def __setup_llm(self, llm_config, task_id=0):
         if self.task_config["tools_config"]["llm_agent"] is not None:
@@ -2198,13 +2293,34 @@ class TaskManager(BaseManager):
             logger.error(f"Error in transcriber {e}")
 
     async def __process_http_transcription(self, message):
+        data = message.get('data')
+
+        # Filter out control/status messages that should NOT trigger LLM.
+        # In streaming mode these are handled explicitly in _listen_transcriber,
+        # but in HTTP mode (Sarvam non-streaming) they arrive in the same channel.
+        if data == 'speech_started':
+            logger.info("HTTP transcription: speech_started received — notifying interruption manager")
+            if self.tools["input"].welcome_message_played():
+                self.interruption_manager.on_user_speech_started()
+            return
+
+        if data == 'speech_ended' or (isinstance(data, dict) and data.get('type') == 'speech_ended'):
+            logger.info("HTTP transcription: speech_ended received — resetting callee_speaking state")
+            self.interruption_manager.on_user_speech_ended(update_utterance_time=False)
+            return
+
+        # Only real transcript strings should reach the LLM pipeline
+        if not isinstance(data, str) or not data.strip():
+            logger.info(f"HTTP transcription: ignoring non-transcript message: {data}")
+            return
+
         meta_info = self.__get_updated_meta_info(message["meta_info"])
 
         sequence = message["meta_info"].get('sequence', meta_info['sequence_id'])
         next_task = self._get_next_step(sequence, "transcriber")
         self.transcriber_duration += message["meta_info"]["transcriber_duration"] if "transcriber_duration" in message["meta_info"] else 0
 
-        await self._handle_transcriber_output(next_task, message['data'], meta_info)
+        await self._handle_transcriber_output(next_task, data, meta_info)
 
 
     #################################################################
@@ -2236,9 +2352,11 @@ class TaskManager(BaseManager):
         all_text_to_be_synthesized = []
         try:
             while not self.conversation_ended:
-                logger.info("Listening to synthesizer")
                 try:
+                    got_message = False
                     async for message in self.tools["synthesizer"].generate():
+                        got_message = True
+                        logger.info("Listening to synthesizer")
                         meta_info = message.get("meta_info", {})
                         current_text = meta_info.get("text", "")
                         write_to_log = False
@@ -2301,6 +2419,13 @@ class TaskManager(BaseManager):
                     logger.error(f"Error in synthesizer: {e}", exc_info=True)
                     self._turn_audio_flushed.set()
                     break
+
+                # If the generator yielded nothing (idle / HTTP mode waiting for next
+                # push), yield control to other tasks before looping again.
+                # Without this the while-loop becomes a tight busy-spin that blocks
+                # the event loop and prevents audio from ever reaching Twilio.
+                if not got_message:
+                    await asyncio.sleep(0.05)
 
             logger.info("Exiting __listen_synthesizer gracefully.")
 

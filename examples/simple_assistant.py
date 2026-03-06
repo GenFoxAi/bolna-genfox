@@ -3,7 +3,7 @@ from bolna.assistant import Assistant
 from bolna.models import (
     Transcriber,
     Synthesizer,
-    ElevenLabsConfig,
+    SarvamConfig,
     LlmAgent,
     SimpleLlmAgent,
 )
@@ -13,7 +13,7 @@ async def main():
     assistant = Assistant(name="demo_agent")
 
     # Configure audio input (ASR)
-    transcriber = Transcriber(provider="deepgram", model="nova-2", stream=True, language="en")
+    transcriber = Transcriber(provider="sarvam", model="saarika:v2.5", stream=True, language="en-IN")
 
     # Configure LLM
     llm_agent = LlmAgent(
@@ -28,9 +28,9 @@ async def main():
 
     # Configure audio output (TTS)
     synthesizer = Synthesizer(
-        provider="elevenlabs",
-        provider_config=ElevenLabsConfig(
-            voice="George", voice_id="JBFqnCBsd6RMkjVDRZzb", model="eleven_turbo_v2_5"
+        provider="sarvam",
+        provider_config=SarvamConfig(
+            voice="meera", voice_id="meera", model="bulbul:v3", language="en-IN"
         ),
         stream=True,
         audio_format="wav",

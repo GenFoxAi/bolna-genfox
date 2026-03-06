@@ -52,7 +52,8 @@ SUPPORTED_LLM_PROVIDERS = {
     LLMProvider.ANTHROPIC.value: LiteLLM,
     LLMProvider.DEEPSEEK.value: LiteLLM,
     LLMProvider.OPENROUTER.value: LiteLLM,
-    LLMProvider.AZURE.value: AzureLLM
+    LLMProvider.AZURE.value: AzureLLM,
+    LLMProvider.GEMINI.value: LiteLLM
 }
 SUPPORTED_INPUT_HANDLERS = {
     TelephonyProvider.DEFAULT.value: DefaultInputHandler,

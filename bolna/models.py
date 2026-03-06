@@ -90,15 +90,15 @@ class AzureConfig(BaseModel):
 
 
 class Transcriber(BaseModel):
-    model: Optional[str] = "nova-2"
-    language: Optional[str] = None
+    model: Optional[str] = "saarika:v2.5"
+    language: Optional[str] = "en-IN"
     stream: bool = False
     sampling_rate: Optional[int] = 16000
     encoding: Optional[str] = "linear16"
     endpointing: Optional[int] = 500
     keywords: Optional[str] = None
     task:Optional[str] = "transcribe"
-    provider: Optional[str] = "deepgram"
+    provider: Optional[str] = "sarvam"
 
     @field_validator("provider")
     def validate_model(cls, value):

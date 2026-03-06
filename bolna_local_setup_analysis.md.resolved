@@ -1,0 +1,248 @@
+# Bolna Local Setup — Deep Analysis
+
+## What Is Bolna?
+
+**Bolna** is an open-source, end-to-end orchestration platform for building **LLM-powered voice agents**. It connects:
+
+- **ASR** (Automatic Speech Recognition) — e.g. Deepgram
+- **LLM** (Large Language Model) — e.g. OpenAI, DeepSeek, Llama via LiteLLM
+- **TTS** (Text-to-Speech) — e.g. ElevenLabs, AWS Polly, Cartesia, OpenAI
+- **Telephony** — Twilio, Plivo (for actual phone calls)
+
+…into a real-time, streaming voice conversation pipeline over **WebSockets**.
+
+---
+
+## Architecture Overview
+
+```mermaid
+graph TB
+    subgraph Docker Compose Stack
+        REDIS["Redis<br/>:6379<br/>Agent & prompt storage"]
+        BOLNA["bolna-app<br/>:5001<br/>FastAPI + WebSocket server"]
+        NGROK["ngrok<br/>:4040<br/>Public URL tunneling"]
+        TWILIO_APP["twilio-app<br/>:8001<br/>Twilio telephony bridge"]
+        PLIVO_APP["plivo-app<br/>:8002<br/>Plivo telephony bridge"]
+    end
+
+    subgraph External Services
+        TWILIO_API["Twilio Cloud API"]
+        PLIVO_API["Plivo Cloud API"]
+        DEEPGRAM["Deepgram ASR"]
+        OPENAI["OpenAI / LiteLLM"]
+        ELEVENLABS["ElevenLabs TTS"]
+    end
+
+    PHONE["📞 Phone Call"]
+
+    PHONE --> TWILIO_API
+    TWILIO_API -->|"HTTP callback"| TWILIO_APP
+    TWILIO_APP -->|"streams via WebSocket"| BOLNA
+    BOLNA --> REDIS
+    BOLNA --> DEEPGRAM
+    BOLNA --> OPENAI
+    BOLNA --> ELEVENLABS
+    NGROK -->|"public URLs for"| TWILIO_APP
+    NGROK -->|"public URLs for"| BOLNA
+```
+
+---
+
+## Container Breakdown (4 services)
+
+### 1. `bolna-app` — The Core Engine (port 5001)
+
+| Aspect | Detail |
+|--------|--------|
+| **Dockerfile** | [dockerfiles/bolna_server.Dockerfile](file:///c:/Users/Farook/Genfox-Works/Realaty/bolna/local_setup/dockerfiles/bolna_server.Dockerfile) |
+| **Base** | `python:3.10.13-slim` |
+| **Key deps** | `ffmpeg`, `gcc`, `g++`, `libgomp1`, `git` |
+| **Python pkg** | Installs `bolna` from GitHub master via pip |
+| **Entry** | `uvicorn quickstart_server:app --host 0.0.0.0 --port 5001` |
+| **Volumes** | `../agent_data` → `/app/agent_data`, AWS creds (read-only) |
+
+**What it runs ([quickstart_server.py](file:///c:/Users/Farook/Genfox-Works/Realaty/bolna/local_setup/quickstart_server.py)):**
+
+A FastAPI app providing:
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/agent` | `POST` | Create agent → stores config in Redis, prompts to local file |
+| `/agent/{id}` | `GET` | Fetch agent config from Redis |
+| `/agent/{id}` | `PUT` | Update agent config |
+| `/agent/{id}` | `DELETE` | Delete agent from Redis |
+| `/all` | `GET` | List all agents |
+| `/chat/v1/{agent_id}` | `WebSocket` | **The real-time voice pipeline** — accepts WebSocket, loads agent config from Redis, creates [AssistantManager](file:///c:/Users/Farook/Genfox-Works/Realaty/bolna/bolna/agent_manager/assistant_manager.py#14-66), runs tasks |
+
+> [!IMPORTANT]
+> The WebSocket endpoint at `/chat/v1/{agent_id}` is the heart of the system. This is where the telephony providers (Twilio/Plivo) stream audio to, and where [AssistantManager](file:///c:/Users/Farook/Genfox-Works/Realaty/bolna/bolna/agent_manager/assistant_manager.py#14-66) orchestrates the ASR→LLM→TTS pipeline in real-time.
+
+### 2. `redis` — Persistence Layer (port 6379)
+
+- Stores agent configurations as JSON strings keyed by `agent_uuid`
+- No persistence volume = **data is lost on container restart**
+- Prompt files stored separately on filesystem at `agent_data/{uuid}/conversation_details.json`
+
+### 3. [ngrok](file:///c:/Users/Farook/Genfox-Works/Realaty/bolna/local_setup/telephony_server/twilio_api_server.py#24-40) — Public URL Tunneling (port 4040)
+
+Creates 3 tunnels so external services (Twilio/Plivo) can reach local containers:
+
+| Tunnel Name | Target | Purpose |
+|-------------|--------|---------|
+| `twilio-app` | `twilio-app:8001` | Twilio webhook callbacks |
+| `plivo-app` | `plivo-app:8002` | Plivo webhook callbacks |
+| `bolna-app` | `bolna-app:5001` | WebSocket streaming endpoint |
+
+> [!WARNING]
+> The ngrok auth token in [ngrok-config.yml](file:///c:/Users/Farook/Genfox-Works/Realaty/bolna/local_setup/ngrok-config.yml) appears to have a placeholder token `<3AIRr...>`. This needs a real token from [ngrok.com](https://ngrok.com).
+
+### 4. `twilio-app` / `plivo-app` — Telephony Bridges (ports 8001/8002)
+
+These are lightweight FastAPI servers that bridge telephony providers to bolna:
+
+**Call flow (Twilio example):**
+1. `POST /call` receives `{agent_id, recipient_phone_number}`
+2. Fetches ngrok tunnel URLs from `http://ngrok:4040/api/tunnels`
+3. Calls `twilio_client.calls.create()` with callback URL pointing to `/twilio_connect`
+4. Twilio calls the number, then calls back to `/twilio_connect`
+5. `/twilio_connect` returns TwiML that opens a `<Stream>` to `wss://bolna-app/chat/v1/{agent_id}`
+6. Audio now flows bidirectionally: Phone ↔ Twilio ↔ WebSocket ↔ Bolna
+
+**Plivo has the same pattern** but uses Plivo's XML format with `<Stream bidirectional="true">` and adds a `/plivo_hangup_callback` endpoint.
+
+---
+
+## Call Flow Sequence
+
+```mermaid
+sequenceDiagram
+    participant User as You (API call)
+    participant Telephony as Twilio/Plivo App
+    participant Ngrok as ngrok
+    participant TelCloud as Twilio/Plivo Cloud
+    participant Phone as 📞 Recipient
+    participant Bolna as bolna-app
+    participant Redis as Redis
+    participant ASR as Deepgram
+    participant LLM as OpenAI
+    participant TTS as ElevenLabs
+
+    User->>Telephony: POST /call {agent_id, phone}
+    Telephony->>Ngrok: GET /api/tunnels
+    Ngrok-->>Telephony: public URLs
+    Telephony->>TelCloud: Create call w/ callback URL
+    TelCloud->>Phone: Ring 📞
+    Phone-->>TelCloud: Answer
+    TelCloud->>Telephony: Callback → /twilio_connect
+    Telephony-->>TelCloud: TwiML → Stream to bolna WS
+    TelCloud->>Bolna: WebSocket connect /chat/v1/{agent_id}
+    Bolna->>Redis: Get agent config
+    Redis-->>Bolna: Agent JSON
+    
+    loop Real-time conversation
+        Phone->>TelCloud: Audio
+        TelCloud->>Bolna: WS audio frames
+        Bolna->>ASR: Transcribe audio
+        ASR-->>Bolna: Text
+        Bolna->>LLM: Generate response
+        LLM-->>Bolna: Streamed text
+        Bolna->>TTS: Synthesize speech
+        TTS-->>Bolna: Audio chunks
+        Bolna->>TelCloud: WS audio response
+        TelCloud->>Phone: Play audio 🔊
+    end
+```
+
+---
+
+## The Quickstart Client ([quickstart_client.py](file:///c:/Users/Farook/Genfox-Works/Realaty/bolna/local_setup/quickstart_client.py))
+
+An alternative to telephony — a **local audio client** that connects directly to bolna's WebSocket:
+
+- Uses **PyAudio** for microphone input (16kHz, mono, PCM16)
+- Uses **sounddevice** for speaker output (24kHz, mono, PCM16)
+- Sends base64-encoded audio frames over WebSocket
+- Handles `"clear"` messages for **interruption support** (stops playing, clears buffer)
+
+> [!NOTE]
+> This client connects to `ws://localhost:5001` directly, bypassing telephony entirely. Useful for testing without phone numbers.
+
+---
+
+## Environment Variables
+
+| Variable | Purpose | Required For |
+|----------|---------|-------------|
+| `DEEPGRAM_AUTH_TOKEN` | ASR (speech-to-text) | Core |
+| `ELEVENLABS_API_KEY` | TTS (text-to-speech) | Core |
+| `OPENAI_API_KEY` | LLM responses | Core |
+| `OPENAI_MODEL` | Default model (`gpt-3.5-turbo`) | Core |
+| `REDIS_URL` | Redis connection (`redis://redis:6379`) | Core |
+| `TWILIO_ACCOUNT_SID` | Twilio auth | Twilio only |
+| `TWILIO_AUTH_TOKEN` | Twilio auth | Twilio only |
+| `TWILIO_PHONE_NUMBER` | Caller ID | Twilio only |
+| `PLIVO_AUTH_ID` | Plivo auth | Plivo only |
+| `PLIVO_AUTH_TOKEN` | Plivo auth | Plivo only |
+| `PLIVO_PHONE_NUMBER` | Caller ID | Plivo only |
+| `AMBIENT_NOISE_PRESETS_DIR` | Path to noise presets | Optional |
+
+---
+
+## Key Observations & Points for Brainstorming
+
+### ✅ Strengths
+1. **Clean separation of concerns** — Telephony, AI orchestration, and storage are properly isolated into separate containers
+2. **Provider-agnostic** — Supports multiple ASR/LLM/TTS/telephony providers via plug-in architecture
+3. **Real-time streaming** — WebSocket-based bidirectional audio with interruption support
+4. **Docker-first** — Easy to spin up locally with `docker compose up`
+5. **Agent CRUD API** — Full REST API for creating/managing agents with JSON configs
+
+### ⚠️ Concerns / Improvement Areas
+
+1. **No Redis persistence** — The Redis container has no volume mount; all agent data is lost on restart
+2. **Bolna installed from GitHub master** — The Dockerfile `pip install`s from `git+https://github.com/bolna-ai/bolna@master`. This means:
+   - No version pinning → builds can break unpredictably
+   - Not using the local source code at all
+3. **ngrok token exposed** — The auth token is in [ngrok-config.yml](file:///c:/Users/Farook/Genfox-Works/Realaty/bolna/local_setup/ngrok-config.yml) (should be in [.env](file:///c:/Users/Farook/Genfox-Works/Realaty/bolna/local_setup/.env))
+4. **No health checks** — Docker Compose has no health check definitions; services depend on each other but can't verify readiness
+5. **`redis.keys("*")`** — The `/all` endpoint scans all Redis keys, which is a known anti-pattern for production
+6. **No authentication** — All endpoints are open with CORS `allow_origins=["*"]`
+7. **AWS creds mounted** — The docker-compose mounts `~/.aws/credentials` into the container (for AWS Polly TTS)
+8. **Windows compatibility** — [start.sh](file:///c:/Users/Farook/Genfox-Works/Realaty/bolna/local_setup/start.sh) is a bash script; won't run natively on Windows without WSL
+
+### 🔍 Questions to Explore
+
+1. **What's our telephony provider?** Twilio or Plivo? Or do we want to use the local client ([quickstart_client.py](file:///c:/Users/Farook/Genfox-Works/Realaty/bolna/local_setup/quickstart_client.py)) without telephony?
+2. **Do we need to modify the bolna core**, or just the local_setup wrapper?
+3. **What's the target deployment?** Local Docker only, or cloud (AWS/GCP/Azure)?
+4. **What AI provider stack** are we targeting? (Which ASR, LLM, TTS?)
+5. **Do we need the ambient noise feature?** (3 WAV presets: call-center, coffee-shop, office-ambience)
+6. **Should we add persistence** to Redis (volume mount) or use a different store?
+
+---
+
+## File Tree Summary
+
+```
+local_setup/
+├── .env                          # Environment variables (API keys)
+├── README.md                     # Setup instructions
+├── docker-compose.yml            # 5 services: bolna, redis, ngrok, twilio, plivo
+├── ngrok-config.yml              # 3 tunnels (twilio, plivo, bolna)
+├── start.sh                      # Quick-start script (bash)
+├── quickstart_server.py          # Main bolna FastAPI server (agent CRUD + WebSocket)
+├── quickstart_client.py          # Local mic/speaker WebSocket client
+├── dockerfiles/
+│   ├── bolna_server.Dockerfile   # Python 3.10 + bolna from GitHub
+│   ├── twilio_server.Dockerfile  # Lightweight Twilio bridge
+│   └── plivo_server.Dockerfile   # Lightweight Plivo bridge
+├── telephony_server/
+│   ├── requirements.txt          # fastapi, twilio, plivo, redis
+│   ├── twilio_api_server.py      # POST /call + /twilio_connect
+│   └── plivo_api_server.py       # POST /call + /plivo_connect + hangup callback
+└── presets/
+    └── ambient_noise/
+        ├── call-center.wav       # ~5.1 MB
+        ├── coffee-shop.wav       # ~2.5 MB
+        └── office-ambience.wav   # ~13 MB
+```

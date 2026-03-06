@@ -4,7 +4,7 @@ import time
 from dotenv import load_dotenv
 from .base_agent import BaseAgent
 from bolna.helpers.utils import format_messages
-from bolna.llms import OpenAiLLM
+from bolna.llms import LiteLLM
 from bolna.prompts import CHECK_FOR_COMPLETION_PROMPT, VOICEMAIL_DETECTION_PROMPT
 from bolna.helpers.logger_config import configure_logger
 
@@ -16,8 +16,8 @@ class StreamingContextualAgent(BaseAgent):
     def __init__(self, llm):
         super().__init__()
         self.llm = llm
-        self.conversation_completion_llm = OpenAiLLM(model=os.getenv('CHECK_FOR_COMPLETION_LLM', llm.model))
-        self.voicemail_llm = OpenAiLLM(model=os.getenv('VOICEMAIL_DETECTION_LLM', "gpt-4.1-mini"))
+        self.conversation_completion_llm = LiteLLM(model=os.getenv('CHECK_FOR_COMPLETION_LLM', llm.model))
+        self.voicemail_llm = LiteLLM(model=os.getenv('VOICEMAIL_DETECTION_LLM', llm.model))
         self.history = [{'content': ""}]
 
     async def check_for_completion(self, messages, check_for_completion_prompt):

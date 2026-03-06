@@ -2,10 +2,14 @@ import os
 import asyncio
 import uuid
 import traceback
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query,Body
+import requests as http_requests
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse
 import redis.asyncio as redis
 from dotenv import load_dotenv
+from twilio.twiml.voice_response import VoiceResponse, Connect
+from twilio.rest import Client
 from bolna.helpers.utils import store_file
 from bolna.prompts import *
 from bolna.helpers.logger_config import configure_logger
@@ -173,6 +177,100 @@ async def get_all_agents():
     except Exception as e:
         logger.error(f"Error fetching all agents: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
+
+
+#############################################################################################
+# Twilio Telephony Routes (merged to work with single ngrok tunnel)
+#############################################################################################
+
+# Initialize Twilio client
+twilio_account_sid = os.getenv('TWILIO_ACCOUNT_SID')
+twilio_auth_token = os.getenv('TWILIO_AUTH_TOKEN')
+twilio_phone_number = os.getenv('TWILIO_PHONE_NUMBER')
+twilio_client = Client(twilio_account_sid, twilio_auth_token) if twilio_account_sid and twilio_auth_token else None
+
+
+def get_tunnel_public_url():
+    """Get the public ngrok tunnel URL for this server."""
+    # First check if manually set via env var
+    tunnel_url = os.getenv('TUNNEL_URL')
+    if tunnel_url:
+        return tunnel_url
+
+    # Try ngrok API
+    try:
+        response = http_requests.get("http://ngrok:4040/api/tunnels", timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            for tunnel in data.get('tunnels', []):
+                if tunnel.get('name') == 'bolna-app':
+                    return tunnel['public_url']
+            # fallback to first tunnel
+            if data.get('tunnels'):
+                return data['tunnels'][0]['public_url']
+    except Exception as e:
+        logger.error(f"Error fetching ngrok tunnels: {e}")
+    
+    logger.error("Could not determine tunnel URL. Set TUNNEL_URL env var manually.")
+    return None
+
+
+@app.post('/call')
+async def make_call(request: Request):
+    try:
+        call_details = await request.json()
+        agent_id = call_details.get('agent_id', None)
+
+        if not agent_id:
+            raise HTTPException(status_code=404, detail="Agent not provided")
+
+        if not call_details or "recipient_phone_number" not in call_details:
+            raise HTTPException(status_code=404, detail="Recipient phone number not provided")
+
+        public_url = get_tunnel_public_url()
+        if not public_url:
+            raise HTTPException(status_code=500, detail="Could not get ngrok public URL")
+
+        bolna_ws_url = public_url.replace('https:', 'wss:')
+
+        logger.info(f'public_url: {public_url}')
+        logger.info(f'bolna_ws_url: {bolna_ws_url}')
+
+        try:
+            call = twilio_client.calls.create(
+                to=call_details.get('recipient_phone_number'),
+                from_=twilio_phone_number,
+                url=f"{public_url}/twilio_connect?bolna_host={bolna_ws_url}&agent_id={agent_id}",
+                method="POST",
+                record=True
+            )
+            logger.info(f"Call created: {call.sid}")
+        except Exception as e:
+            logger.error(f'make_call exception: {str(e)}')
+            raise HTTPException(status_code=500, detail=str(e))
+
+        return PlainTextResponse("done", status_code=200)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Exception occurred in make_call: {e}")
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+
+
+@app.post('/twilio_connect')
+async def twilio_connect(bolna_host: str = Query(...), agent_id: str = Query(...)):
+    try:
+        response = VoiceResponse()
+        connect = Connect()
+        bolna_websocket_url = f'{bolna_host}/chat/v1/{agent_id}'
+        connect.stream(url=bolna_websocket_url)
+        logger.info(f"websocket connection done to {bolna_websocket_url}")
+        response.append(connect)
+        return PlainTextResponse(str(response), status_code=200, media_type='text/xml')
+    except Exception as e:
+        logger.error(f"Exception occurred in twilio_callback: {e}")
+        raise HTTPException(status_code=500, detail="Internal Server Error")
 
 
 ############################################################################################# 

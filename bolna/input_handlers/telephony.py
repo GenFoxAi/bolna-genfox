@@ -84,6 +84,7 @@ class TelephonyInputHandler(DefaultInputHandler):
         while True:
             try:
                 message = await self.websocket.receive_text()
+                logger.info(f"RAW WEBSOCKET MESSAGE: {message}")
 
                 packet = json.loads(message)
                 if packet['event'] == 'start':

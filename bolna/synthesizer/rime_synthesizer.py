@@ -134,6 +134,9 @@ class RimeSynthesizer(BaseSynthesizer):
 
             # Ensure the WebSocket connection is established
             while self.websocket_holder["websocket"] is None or self.websocket_holder["websocket"].state is websockets.protocol.State.CLOSED:
+                if self.conversation_ended:
+                    logger.info("Conversation ended, stopping sender wait loop")
+                    return
                 logger.info("Waiting for elevenlabs ws connection to be established...")
                 await asyncio.sleep(1)
 
@@ -311,6 +314,8 @@ class RimeSynthesizer(BaseSynthesizer):
     async def monitor_connection(self):
         # Periodically check if the connection is still alive
         while True:
+            if self.conversation_ended:
+                break
             if self.websocket_holder["websocket"] is None or self.websocket_holder["websocket"].state is websockets.protocol.State.CLOSED:
                 logger.info("Re-establishing rime connection...")
                 self.websocket_holder["websocket"] = await self.establish_connection()

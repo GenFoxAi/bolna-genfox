@@ -1,13 +1,11 @@
-version: '3'
-
 services:
 
   # main bolna service
   bolna-app:
     build:
-      context: .
-      dockerfile: dockerfiles/bolna_server.Dockerfile
-    image: bolna-app:latest  # This will tag the built image
+      context: ..
+      dockerfile: local_setup/dockerfiles/bolna_server.Dockerfile
+    image: bolna-app:latest
     ports:
       - "5001:5001"
     depends_on:
@@ -16,8 +14,6 @@ services:
       - .env
     volumes:
       - ../agent_data:/app/agent_data
-      - $HOME/.aws/credentials:/root/.aws/credentials:ro
-      - $HOME/.aws/config:/root/.aws/config:ro
 
   # redis service used as a persistent storage
   redis:
@@ -25,45 +21,16 @@ services:
     ports:
       - "6379:6379"
 
-  # ngrok for local tunneling
+ # ngrok for local tunneling
   ngrok:
     image: ngrok/ngrok:latest
     restart: unless-stopped
+    environment:
+      - NGROK_AUTHTOKEN=3AP4JV2AmehKj41lnAwbWtaBdOj_2VSkpuo2M3NQVUUnQyGot
     command:
-      - "start"
-      - "--all"
-      - "--config"
-      - "/etc/ngrok.yml"
-    volumes:
-      - ./ngrok-config.yml:/etc/ngrok.yml
+      - "http"
+      - "bolna-app:5001"
+      - "--domain=ronald-statant-contrastively.ngrok-free.dev"
+      - "--log=stdout"
     ports:
       - 4040:4040
-
-  ### Telephony servers ###
-  twilio-app:
-    build:
-      context: .
-      dockerfile: dockerfiles/twilio_server.Dockerfile
-    image: twilio-app:latest  # This will tag the built image
-    ports:
-      - "8001:8001"
-    depends_on:
-      - redis
-      - ngrok
-      - bolna-app
-    env_file:
-      - .env
-
-  plivo-app:
-    build:
-      context: .
-      dockerfile: dockerfiles/plivo_server.Dockerfile
-    image: plivo-app:latest  # This will tag the built image
-    ports:
-      - "8002:8002"
-    depends_on:
-      - redis
-      - ngrok
-      - bolna-app
-    env_file:
-      - .env

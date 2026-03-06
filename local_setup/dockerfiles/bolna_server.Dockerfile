@@ -19,9 +19,9 @@ RUN apt-get update && \
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --upgrade pip setuptools wheel
 
-# Install uvicorn first
+# Install uvicorn with websocket support
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install uvicorn
+    pip install 'uvicorn[standard]'
 
 # Install common dependencies that bolna requires
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -32,16 +32,24 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     huggingface-hub \
     numpy \
     tqdm \
-    requests
+    requests \
+    twilio
 
-# Install bolna package with verbose output for debugging
+# Copy the local bolna package source from repo root
+COPY bolna /app/bolna_src/bolna
+COPY pyproject.toml /app/bolna_src/pyproject.toml
+COPY requirements.txt /app/bolna_src/requirements.txt
+COPY README.md /app/bolna_src/README.md
+
+# Install bolna from local source
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --verbose git+https://github.com/bolna-ai/bolna@master || \
+    cd /app/bolna_src && \
+    pip install --verbose . || \
     (echo "Failed to install bolna package. See error above." && exit 1)
 
-# Copy application files
-COPY quickstart_server.py /app/
-COPY presets /app/presets
+# Copy application files from local_setup
+COPY local_setup/quickstart_server.py /app/
+COPY local_setup/presets /app/presets
 
 EXPOSE 5001
 

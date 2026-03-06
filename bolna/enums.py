@@ -91,6 +91,7 @@ class LLMProvider(str, Enum):
     DEEPSEEK = "deepseek"
     OPENROUTER = "openrouter"
     AZURE = "azure"
+    GEMINI = "gemini"
 
     @classmethod
     def all_values(cls):
